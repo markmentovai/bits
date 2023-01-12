@@ -1,0 +1,8 @@
+{
+  BasedOnStyle: Chromium,
+  AlignTrailingComments: false,
+  BinPackArguments: false,
+  PointerAlignment: Middle,
+  QualifierAlignment: Custom,
+  QualifierOrder: ['inline', 'static', 'constexpr', 'type', 'const', 'volatile', 'restrict']
+}
