@@ -63,10 +63,13 @@ import csv
 import os
 import re
 import sys
-import tempfile
 import zipfile
 
 import fitz
+
+
+class FaaCsAanException(Exception):
+    pass
 
 
 def _first_non_none(*sequence):
@@ -138,36 +141,19 @@ class _PdfSource:
             self._member_re = member_re
 
         def pdfs(self):
-            tempdir = None
-            try:
-                for member_path in zipfile.Path(self._zip).iterdir():
-                    if (self._member_re is not None and
-                            not self._member_re.match(member_path.name)):
-                        continue
-                    if tempdir is None:
-                        tempdir = tempfile.TemporaryDirectory(
-                            prefix=os.path.basename(
-                                re.sub(r'(\.py)?$', '.', __file__, 1,
-                                       re.IGNORECASE)),
-                            ignore_cleanup_errors=True)
+            for member_zipinfo in self._zip.infolist():
+                if os.sep in member_zipinfo.filename:
+                    # Only process members at the .zip file’s root, for
+                    # compatibility with _Dir.
+                    continue
+                if (self._member_re is not None and
+                        not self._member_re.match(member_zipinfo.filename)):
+                    continue
 
-                    # fitz.Document needs a named file on disk, so extract it.
-                    self._zip.extract(member_path.name, tempdir.name)
-                    extracted_path = os.path.join(tempdir.name,
-                                                  member_path.name)
-                    yield _FitzDocument_WithDisplayPath(
-                        extracted_path,
-                        display_path=os.path.join(self._zip.filename,
-                                                  member_path.name))
-                    try:
-                        os.remove(extracted_path)
-                    except:
-                        # Best-effort.
-                        pass
-
-            finally:
-                if tempdir is not None:
-                    tempdir.cleanup()
+                yield _FitzDocument_WithDisplayPath(
+                    stream=self._zip.read(member_zipinfo),
+                    display_path=os.path.join(self._zip.filename,
+                                              member_zipinfo.filename))
 
     class _Dir:
 
@@ -200,12 +186,12 @@ class _PdfSource:
 _aan_tuple = collections.namedtuple(
     '_aan_tuple', ('faa_id', 'airport_name', 'cs_pdf_page', 'page_label'))
 
-_PAGE_HEADER_RE = re.compile(r'^(?:(?P<even_page_label>[A-Z]?\d+)(?:\n|$))?' +
-                             r'(?P<section_name>.*)' +
-                             r'(?:\n(?P<odd_page_label>[A-Z]?\d+))?$')
+_PAGE_HEADER_RE = re.compile(r'^(?:(?P<even_page_label>[A-Z]?[0-9]+)(?:\n|$))?'
+                             r'(?P<section_name>.*)'
+                             r'(?:\n(?P<odd_page_label>[A-Z]?[0-9]+))?$')
 
-_ARRIVAL_ALERT_RE = re.compile(r'^(?P<airport_name>.+) ' +
-                               r'\((?P<faa_id>[A-Z0-9]{3,4})\) ' +
+_ARRIVAL_ALERT_RE = re.compile(r'^(?P<airport_name>.+) '
+                               r'\((?P<faa_id>[A-Z0-9]{3,4})\) '
                                r'ARRIVAL ALERT$')
 
 
@@ -214,7 +200,7 @@ def cs_arrival_alert_notices(cs_pdf):
     Alert Notice page contained therein."""
 
     _TOC_SPECIAL_NOTICES_RE = re.compile(
-        r'^Special Notices *\.+ *(?P<page_label>\d+)$')
+        r'^Special Notices *\.+ *(?P<page_label>[0-9]+)$')
 
     found_toc = False
     found_special_notices = False
@@ -267,7 +253,8 @@ def cs_arrival_alert_notices(cs_pdf):
                         toc_special_notices_match.group('page_label')) - int(
                             page_label)
                     if page_offset <= 0:
-                        raise Exception('TOC indicates notices precede TOC')
+                        raise FaaCsAanException(
+                            'TOC indicates notices precede TOC')
 
                     # Subtract 1 to counteract the `page_number += 1` at the top
                     # of the loop body.
@@ -299,7 +286,7 @@ def cs_arrival_alert_notices(cs_pdf):
                          page_label)
 
     if not found_special_notices:
-        raise Exception('did not find SPECIAL NOTICES section')
+        raise FaaCsAanException('did not find SPECIAL NOTICES section')
 
 
 def _remove_header_footer(aan_pdf_page):
@@ -315,21 +302,24 @@ def _remove_header_footer(aan_pdf_page):
     # below text_blocks[-2]. That means that there must be at least three text
     # blocks: a header, at least some content, and a footer.
     if len(text_blocks) < 3:
-        raise Exception('too few text blocks')
+        raise FaaCsAanException('too few text blocks')
 
     # Check the header, the beginning of the content, and the footer against
     # expected patterns to be safe, because removal is a destructive operation.
     if not _PAGE_HEADER_RE.match(text_blocks[0][4]):
-        raise Exception('unexpected header text')
+        raise FaaCsAanException('unexpected header text')
 
     if not _ARRIVAL_ALERT_RE.match(
             re.sub(r'[ \n]+', ' ', text_blocks[1][4].rstrip('\n'))):
-        raise Exception('unexpected title text')
+        raise FaaCsAanException('unexpected title text')
 
+    # “VOL, EFFECTIVE_DATE to EXPIRY_DATE”. Example: “NE, 5 OCT 2023 to 30 NOV
+    # 2023”.
     if not re.match(
-            r'^[A-Z]{2,3}, \d{1,2} [A-Z]{3} \d{4} to \d{1,2} [A-Z]{3} \d{4}$',
-            text_blocks[-1][4]):
-        raise Exception('unexpected footer text')
+            r'^[A-Z]{2,3}, '
+            r'[0-9]{1,2} [A-Z]{3} [0-9]{4} to '
+            r'[0-9]{1,2} [A-Z]{3} [0-9]{4}$', text_blocks[-1][4]):
+        raise FaaCsAanException('unexpected footer text')
 
     aan_pdf_page.add_redact_annot(fitz.Rect(aan_pdf_page.mediabox.x0,
                                             aan_pdf_page.mediabox.y0,
@@ -363,13 +353,11 @@ def extract_cs_arrival_alert_notices(cs_pdf,
     aan_pdf = None
     try:
         for aan in cs_arrival_alert_notices(cs_pdf):
-            if output_pdf and (aan_pdf is None or
-                               last_aan_faa_id != aan.faa_id):
+            if output_pdf and last_aan_faa_id != aan.faa_id:
                 last_aan_faa_id = aan.faa_id
 
                 if aan_pdf is not None:
                     aan_pdf.close()
-                    aan_pdf = None
 
                 airport_aan_path = re.sub(r'(\.(pdf|zip))?$',
                                           '_aan_' + aan.faa_id + '.pdf',
@@ -400,7 +388,8 @@ class _Callback:
 
     def __init__(self, *, quiet=False, use_csv=False):
         self._quiet = quiet
-        self._csv = csv.writer(sys.stdout) if use_csv else None
+        self._csv = (csv.writer(sys.stdout, lineterminator=os.linesep)
+                     if use_csv else None)
         self._last_airport_aan_path = None
 
     def _callback(self, aan, airport_aan_path, airport_aan_page):
@@ -410,11 +399,15 @@ class _Callback:
         if self._csv is not None:
             # Add 1 to PDF page numbers to transition from 0-based to 1-based
             # page numbering, as is customarily expected by users of PDFs.
-            self._csv.writerow(
-                (aan.cs_pdf_page.parent.display_path,
-                 aan.cs_pdf_page.number + 1, aan.page_label, aan.faa_id,
-                 aan.airport_name, airport_aan_path, airport_aan_page +
-                 1 if airport_aan_page is not None else None),)
+            self._csv.writerow((
+                aan.cs_pdf_page.parent.display_path,
+                aan.cs_pdf_page.number + 1,
+                aan.page_label,
+                aan.faa_id,
+                aan.airport_name,
+                airport_aan_path,
+                airport_aan_page + 1 if airport_aan_page is not None else None,
+            ),)
             return
 
         if airport_aan_path != self._last_airport_aan_path:
@@ -428,13 +421,13 @@ def main(args):
     parser.add_argument('file',
                         metavar='chart_supplement',
                         nargs='+',
-                        help='a chart supplement volume or rear matter PDF, ' +
+                        help='a chart supplement volume or rear matter PDF, '
                         'or a .zip file or directory containing these PDFs')
     pdf_out_group = parser.add_mutually_exclusive_group()
     pdf_out_group.add_argument(
         '--out-dir',
         metavar='dir',
-        help='where to write extracted arrival alert notice PDFs ' +
+        help='where to write extracted arrival alert notice PDFs '
         '(default: same directory as chart_supplement)')
     pdf_out_group.add_argument(
         '--no-pdf-output',
@@ -449,13 +442,13 @@ def main(args):
         '-q',
         '--quiet',
         action='store_true',
-        help='don’t produce any output on standard output ' +
+        help='don’t produce any output on standard output '
         '(default: write output filenames to standard output)')
     metadata_out_group.add_argument(
         '--csv',
         action='store_true',
-        help='write arrival alert notice information to standard output in ' +
-        'CSV format')
+        help='write arrival alert notice information to standard output in CSV '
+        'format')
     parsed = parser.parse_args(args)
 
     if not parsed.pdf_output and not parsed.csv:
@@ -468,8 +461,9 @@ def main(args):
     # Match both cover-to-cover volume and DCS “application data” rear matter
     # PDF filename conventions.
     _MEMBER_RE = re.compile(
-        r'^((CS_[A-Z]{2,3}_\d{8})|([A-Z]{2,3}_rear_\d{2}[A-Z]{3}\d{4}))\.pdf$',
-        re.IGNORECASE)
+        r'^((CS_[A-Z]{2,3}_[0-9]{8})|'
+        r'([A-Z]{2,3}_rear_[0-9]{2}[A-Z]{3}[0-9]{4}))'
+        r'\.pdf$', re.IGNORECASE)
 
     for cs_path in parsed.file:
         pdf_source = _PdfSource(cs_path, _MEMBER_RE)
