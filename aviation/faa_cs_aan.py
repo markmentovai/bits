@@ -52,14 +52,14 @@ extraction disabled (--no-pdf-output) as a means of identifying the notices for
 the benefit of another tool capable of operating directly with pages within PDF
 documents.
 
-When producing CSV output, text may be extracted from arrival alert notices
-(option --text). Some notices do not contain machine-readable text. In these
-cases, OCR can be used to recover the text from such notices (option
---text-ocr). Tesseract is used to perform OCR; both Tesseract and
-English-language data (tessdata-eng) must be installed for this feature to work,
-and it may also be necessary to set the TESSDATA_PREFIX environment variable to
-the location of Tesseract data (such as /usr/share/tessdata). OCR will only be
-used to recover text that is not machine-readable.
+Text may be extracted from arrival alert notices (option --text). Some notices
+do not contain machine-readable text in full. In these cases, OCR can be used to
+recover the text from such notices (option --ocr). Tesseract is used to perform
+OCR; both Tesseract and English-language data (tessdata-eng) must be installed
+for this feature to work, and it may also be necessary to set the
+TESSDATA_PREFIX environment variable to the location of Tesseract data (such as
+/usr/share/tessdata). OCR will only be used to recover text that is not
+machine-readable.
 
 The chart supplement header and footer may optionally be removed from extracted
 arrival alert notices (--no-header-footer).
@@ -239,8 +239,15 @@ class _PdfSource:
         yield from self._source.pdfs()
 
 
-_aan_tuple = collections.namedtuple(
-    '_aan_tuple', ('faa_id', 'airport_name', 'cs_pdf_page', 'page_label'))
+_aan_tuple = collections.namedtuple('_aan_tuple', (
+    'faa_id',
+    'airport_name',
+    'cs_pdf_page',
+    'page_label',
+    'volume',
+    'volume_effective_from',
+    'volume_effective_to',
+))
 
 _PAGE_HEADER_RE = re.compile(r'^(?:(?P<even_page_label>[A-Z]?[0-9]+)(?:\n|$))?'
                              r'(?P<section_name>.*)'
@@ -249,6 +256,47 @@ _PAGE_HEADER_RE = re.compile(r'^(?:(?P<even_page_label>[A-Z]?[0-9]+)(?:\n|$))?'
 _ARRIVAL_ALERT_RE = re.compile(r'^(?P<airport_name>.+) '
                                r'\((?P<faa_id>[A-Z0-9]{3,4})\) '
                                r'ARRIVAL ALERT$')
+
+# “VOL, EFFECTIVE_DATE to EXPIRY_DATE”. Example: “NE, 5 OCT 2023 to 30 NOV
+# 2023”.
+_PAGE_FOOTER_RE = re.compile(r'^([A-Z]{2,3}), '
+                             r'([0-9]{1,2} [A-Z]{3} [0-9]{4}) to '
+                             r'([0-9]{1,2} [A-Z]{3} [0-9]{4})$')
+
+
+def _string_to_date(s):
+    """Convert a string of the form “2 NOV 2023” to a datetime.date object."""
+
+    # Don’t use datetime.datetime.strptime because it’s locale-sensitive.
+    # Attempt to match both short (abbreviated) and long (full) month names.
+    # Most dates use the abbreviated form but the AAN at VGT uses the full form
+    # (“29 DECEMBER 2022”).
+    _MONTHS = (
+        'January',
+        'February',
+        'March',
+        'April',
+        'May',
+        'June',
+        'July',
+        'August',
+        'September',
+        'October',
+        'November',
+        'December',
+    )
+    _LONG_MONTH_TO_NUM = dict(
+        (enum[1].lower(), enum[0]) for enum in enumerate(_MONTHS, 1))
+    _SHORT_MONTH_TO_NUM = dict(
+        (enum[1].lower()[:3], enum[0]) for enum in enumerate(_MONTHS, 1))
+
+    match = re.match(r'([0-9]{1,2}) ([A-Z]{3,}) ([0-9]{4})$', s, re.IGNORECASE)
+    return datetime.date(
+        int(match.group(3)),
+        _first_non_none(
+            _SHORT_MONTH_TO_NUM.get(match.group(2)[:3].lower(), None),
+            _LONG_MONTH_TO_NUM.get(match.group(2).lower(), None)),
+        int(match.group(1)))
 
 
 def cs_arrival_alert_notices(cs_pdf):
@@ -336,16 +384,24 @@ def cs_arrival_alert_notices(cs_pdf):
             # Only process arrival alert notices.
             continue
 
+        footer_match = _PAGE_FOOTER_RE.match(text_blocks[-1][4])
+
         # This is an arrival alert notice.
         yield _aan_tuple(arrival_alert_match.group('faa_id'),
                          arrival_alert_match.group('airport_name'), page,
-                         page_label)
+                         page_label, footer_match.group(1),
+                         _string_to_date(footer_match.group(2)),
+                         _string_to_date(footer_match.group(3)))
 
     if not found_special_notices:
         raise FaaCsAanException('did not find SPECIAL NOTICES section')
 
 
 def _validate_cs_aan_pdf_text_blocks(blocks):
+    """Raises an exception if `blocks` are not text blocks extracted from an
+    Arrival Alert Notice page in a Chart Supplement.
+    """
+
     # text_blocks[0] will be the header line, and text_blocks[-1] will be the
     # footer line. There may be a horizontal rule between the header line and
     # the page content, and there may be a horizontal rule between the page
@@ -364,16 +420,13 @@ def _validate_cs_aan_pdf_text_blocks(blocks):
             re.sub(r'[ \n]+', ' ', blocks[1][4].rstrip('\n'))):
         raise FaaCsAanException('unexpected title text')
 
-    # “VOL, EFFECTIVE_DATE to EXPIRY_DATE”. Example: “NE, 5 OCT 2023 to 30 NOV
-    # 2023”.
-    if not re.match(
-            r'^[A-Z]{2,3}, '
-            r'[0-9]{1,2} [A-Z]{3} [0-9]{4} to '
-            r'[0-9]{1,2} [A-Z]{3} [0-9]{4}$', blocks[-1][4]):
+    if not _PAGE_FOOTER_RE.match(blocks[-1][4]):
         raise FaaCsAanException('unexpected footer text')
 
 
 def _remove_header_footer(aan_pdf_page):
+    """Removes the header and footer from an Arrival Alert Notice PDF page."""
+
     text_blocks = aan_pdf_page.get_text('blocks',
                                         flags=fitz.TEXT_PRESERVE_LIGATURES |
                                         fitz.TEXT_PRESERVE_WHITESPACE |
@@ -447,37 +500,44 @@ def extract_cs_arrival_alert_notices(cs_pdf,
             aan_pdf.close()
 
 
-def _string_to_date(s):
-    # Don’t use datetime.datetime.strptime because it’s locale-sensitive.
-    # Attempt to match both short (abbreviated) and long (full) month names.
-    # Most use the abbreviated form (“19 MAY 2022”) but VGT uses the full form
-    # (“29 DECEMBER 2022”).
-    _MONTHS = (
-        'January',
-        'February',
-        'March',
-        'April',
-        'May',
-        'June',
-        'July',
-        'August',
-        'September',
-        'October',
-        'November',
-        'December',
-    )
-    _LONG_MONTH_TO_NUM = dict(
-        (enum[1].lower(), enum[0]) for enum in enumerate(_MONTHS, 1))
-    _SHORT_MONTH_TO_NUM = dict(
-        (enum[1].lower()[:3], enum[0]) for enum in enumerate(_MONTHS, 1))
+def _words_to_blocks(words):
+    """Merges a list of words into a list of blocks.
 
-    match = re.match(r'([0-9]{1,2}) ([A-Z]{3,}) ([0-9]{4})$', s, re.IGNORECASE)
-    return datetime.date(
-        int(match.group(3)),
-        _first_non_none(
-            _SHORT_MONTH_TO_NUM.get(match.group(2)[:3].lower(), None),
-            _LONG_MONTH_TO_NUM.get(match.group(2).lower(), None)),
-        int(match.group(1)))
+    This operates on a word list such as one returned by
+    fitz.TextPage.extractWORDS, and returns a block list in the style of
+    fitz.TextPage.extractBLOCKS. It may be desirable to use this so that the
+    word list can be manipulated or filtered prior to building blocks.
+    """
+
+    blocks = []
+    last_line_num = None
+    for word in words:
+        word_rect = fitz.Rect(word[0:4])
+        word_text, word_block_num, word_line_num = word[4:7]
+        if len(blocks) == 0 or word_block_num != blocks[-1][2]:
+            last_line_num = word_line_num
+            blocks.append([word_rect, word_text, word_block_num])
+        elif word_line_num != last_line_num:
+            last_line_num = word_line_num
+            blocks[-1][0].include_rect(word_rect)
+            blocks[-1][1] += '\n' + word_text
+        else:
+            blocks[-1][0].include_rect(word_rect)
+            blocks[-1][1] += ' ' + word_text
+
+    # The block list is a list of tuples each corresponding to a block, the
+    # fitz.Rect is flattened to a “rect-like” sequence of points, and a final
+    # `block_type` element indicates whether the block is an image block (0 for
+    # text).
+    return [(
+        block[0].x0,
+        block[0].y0,
+        block[0].x1,
+        block[0].y1,
+        block[1],
+        block[2],
+        0,
+    ) for block in blocks]
 
 
 _text_tuple = collections.namedtuple('_text_tuple', (
@@ -489,11 +549,20 @@ _text_tuple = collections.namedtuple('_text_tuple', (
     'email',
     'effective_from',
     'effective_to',
-    'used_ocr',
+    'ocr',
 ))
 
 
 def extract_text_from_cs_arrival_alert_notice(aan_pdf_page, *, allow_ocr=False):
+    """Extracts text from an Arrival Alert Notice PDF page, returning a
+    `_text_tuple` containing the extracted information.
+
+    If `allow_ocr` is True, OCR will be performed if the text in the page is not
+    machine-readable, as indicated by text containing u+fffd replacement
+    characters. Even when OCR is performed, the results of OCR are only used in
+    place of text blocks that contain such replacement characters.
+    """
+
     blocks = aan_pdf_page.get_text(
         'blocks',
         flags=fitz.TEXT_PRESERVE_LIGATURES | fitz.TEXT_PRESERVE_WHITESPACE |
@@ -515,10 +584,10 @@ def extract_text_from_cs_arrival_alert_notice(aan_pdf_page, *, allow_ocr=False):
 
     # If any Unicode replacement characters (u+fffd) are found and OCR is
     # allowed, try to use OCR to read the text.
+    need_ocr = any('\ufffd' in text_block[4] for text_block in text_blocks)
     used_ocr = False
     use_blocks = text_blocks
-    if (allow_ocr and
-            any('\ufffd' in text_block[4] for text_block in text_blocks)):
+    if need_ocr and allow_ocr:
         # fitz.get_tessdata is new in 1.23.
         textpage_ocr = aan_pdf_page.get_textpage_ocr(
             flags=fitz.TEXT_PRESERVE_LIGATURES | fitz.TEXT_PRESERVE_WHITESPACE |
@@ -527,12 +596,22 @@ def extract_text_from_cs_arrival_alert_notice(aan_pdf_page, *, allow_ocr=False):
             full=True,
             tessdata=(fitz.get_tessdata()
                       if hasattr(fitz, 'get_tessdata') else None))
-        ocr_blocks = textpage_ocr.extractBLOCKS()
-        ocr_blocks = [
-            ocr_block for ocr_block in ocr_blocks if not any(
-                fitz.Rect(ocr_block[0:4]).intersects(image_rect)
+
+        # It would be easier to extract blocks, but LNK landing S has its
+        # “Off-set Parallels” text close enough to the image that it’s extracted
+        # in a block along with garbage data interpreted from the image, and is
+        # then excluded from later consideration because the block overlaps the
+        # image. So instead of extracting blocks, extract words, filter out any
+        # word that overlaps with an image, and reassemble into lines and
+        # blocks.
+        ocr_words = textpage_ocr.extractWORDS()
+        ocr_words = [
+            ocr_word for ocr_word in ocr_words if not any(
+                fitz.Rect(ocr_word[0:4]).intersects(image_rect)
                 for image_rect in image_rects)
         ]
+
+        ocr_blocks = _words_to_blocks(ocr_words)
 
         use_blocks = []
         for text_block in text_blocks:
@@ -618,10 +697,14 @@ def extract_text_from_cs_arrival_alert_notice(aan_pdf_page, *, allow_ocr=False):
 
     disclaimers_match = re.search(
         'Not for navigation|For situational awareness', text, re.IGNORECASE)
-    disclaimers = text[disclaimers_match.start():].split('\n')
-    text = text[:disclaimers_match.start()].rstrip(' \n')
+    if disclaimers_match is not None:
+        disclaimers = text[disclaimers_match.start():].split('\n')
+        text = text[:disclaimers_match.start()].rstrip(' \n')
+    else:
+        disclaimers = None
 
-    title_match = re.match(r'((?!Pilot)[^\n]*)(?:\n|$)', text, re.IGNORECASE)
+    title_match = re.match(r'((?!Pilot|\ufffd)[^\n]*)(?:\n|$)', text,
+                           re.IGNORECASE)
     if title_match is not None:
         title = title_match.group(1).rstrip(' \n')
         text = text[title_match.end():].lstrip(' \n')
@@ -640,8 +723,21 @@ def extract_text_from_cs_arrival_alert_notice(aan_pdf_page, *, allow_ocr=False):
         email,
         effective_from,
         effective_to,
-        used_ocr,
+        need_ocr + used_ocr,
     )
+
+
+def _list_join(l, separator='|', *, escape='\\'):
+    """Joins a list of strings into a single string.
+
+    Elements are separated by `separator`. If `separator` or `escape` already
+    appear in any element, they will have `escape` prepended.
+    """
+
+    return (separator.join(
+        element.replace(escape, 2 * escape).replace(separator, escape +
+                                                    separator)
+        for element in l))
 
 
 class _Callback:
@@ -651,13 +747,13 @@ class _Callback:
                  quiet=False,
                  use_csv=False,
                  text=False,
-                 text_ocr=False,
+                 ocr=False,
                  pdf_output=True):
         self._quiet = quiet
         self._csv = (csv.writer(sys.stdout, lineterminator=os.linesep)
                      if use_csv else None)
         self._text = text
-        self._text_ocr = text_ocr
+        self._ocr = ocr
         self._pdf_output = pdf_output
         self._needs_csv_header = True
         self._last_airport_aan_path = None
@@ -666,6 +762,9 @@ class _Callback:
         if self._quiet:
             return
 
+        text_tuple = extract_text_from_cs_arrival_alert_notice(
+            aan.cs_pdf_page, allow_ocr=self._ocr) if self._text else None
+
         if self._csv is not None:
             if self._needs_csv_header:
                 self._needs_csv_header = False
@@ -673,8 +772,11 @@ class _Callback:
                 row = [
                     'cs_pdf_path',
                     'cs_pdf_page_number',
-                    'cs_pdf_page_label',
-                    'faa_id',
+                    'cs_page_label',
+                    'cs_volume',
+                    'cs_volume_effective_from',
+                    'cs_volume_effective_to',
+                    'airport_faa_id',
                     'airport_name',
                 ]
                 if self._pdf_output:
@@ -684,24 +786,29 @@ class _Callback:
                     ])
                 if self._text:
                     row.extend([
-                        'landing_direction',
-                        'locations',
-                        'title',
-                        'text',
-                        'disclaimers',
-                        'email',
-                        'effective_from',
-                        'effective_to',
+                        'aan_landing_direction',
+                        'aan_locations',
+                        'aan_title',
+                        'aan_text',
+                        'aan_disclaimers',
+                        'aan_inquiry_email',
+                        'aan_effective_from',
+                        'aan_effective_to',
+                        'ocr',
                     ])
-                if self._text_ocr:
-                    row.append('used_ocr')
                 self._csv.writerow(row)
 
             # Add 1 to PDF page numbers to transition from 0-based to 1-based
             # page numbering, as is customarily expected by users of PDFs.
             row = [
-                aan.cs_pdf_page.parent.display_path, aan.cs_pdf_page.number + 1,
-                aan.page_label, aan.faa_id, aan.airport_name
+                aan.cs_pdf_page.parent.display_path,
+                aan.cs_pdf_page.number + 1,
+                aan.page_label,
+                aan.volume,
+                aan.volume_effective_from,
+                aan.volume_effective_to,
+                aan.faa_id,
+                aan.airport_name,
             ]
             if self._pdf_output:
                 row.extend([
@@ -711,26 +818,58 @@ class _Callback:
                 ])
 
             if self._text:
-                text_tuple = extract_text_from_cs_arrival_alert_notice(
-                    aan.cs_pdf_page, allow_ocr=self._text_ocr)
                 row.append(text_tuple.landing_direction)
-                row.append('|'.join(text_tuple.locations))
+                row.append(_list_join(text_tuple.locations))
                 row.append(text_tuple.title)
                 row.append(text_tuple.text)
-                row.append('|'.join(text_tuple.disclaimers))
+                row.append(
+                    _list_join([] if text_tuple.disclaimers is
+                               None else text_tuple.disclaimers))
                 row.append(text_tuple.email)
                 row.append(text_tuple.effective_from)
                 row.append(text_tuple.effective_to)
-            if self._text_ocr:
-                row.append(1 if text_tuple.used_ocr else None)
+                row.append(text_tuple.ocr if text_tuple.ocr else None)
 
             self._csv.writerow(row)
 
             return
 
-        if airport_aan_path != self._last_airport_aan_path:
+        if self._text or airport_aan_path != self._last_airport_aan_path:
             self._last_airport_aan_path = airport_aan_path
-            print(airport_aan_path)
+            if airport_aan_path is not None:
+                print(airport_aan_path)
+            else:
+                print('%s:%d' % (aan.cs_pdf_page.parent.display_path,
+                                 aan.cs_pdf_page.number + 1))
+
+        if self._text:
+            print('  %s (%s) ARRIVAL ALERT' % (aan.airport_name, aan.faa_id))
+            print(
+                '  Landing %s' % {
+                    'N': 'North',
+                    'NE': 'Northeast',
+                    'E': 'East',
+                    'SE': 'Southeast',
+                    'S': 'South',
+                    'SW': 'Southwest',
+                    'W': 'West',
+                    'NW': 'Northwest',
+                }[text_tuple.landing_direction])
+            print('  %s' % ' and '.join(text_tuple.locations))
+            if text_tuple.title is not None:
+                print('  %s' % text_tuple.title)
+            print('  %s' % text_tuple.text)
+            if text_tuple.disclaimers is not None:
+                for disclaimer in text_tuple.disclaimers:
+                    print('  %s' % disclaimer)
+            if text_tuple.email is not None:
+                print('  For inquiries: %s' % text_tuple.email)
+            if (text_tuple.effective_from is not None and
+                    text_tuple.effective_to is not None):
+                # TODO: %b is locale-sensitive!
+                print('  Effective %s to %s' %
+                      (text_tuple.effective_from.strftime('%d %b %Y').upper(),
+                       text_tuple.effective_to.strftime('%d %b %Y').upper()))
 
 
 def main(args):
@@ -755,14 +894,12 @@ def main(args):
     parser.add_argument('--no-header-footer',
                         action='store_true',
                         help='remove headers and footers from extracted PDFs')
-    metadata_out_group = parser.add_mutually_exclusive_group()
-    metadata_out_group.add_argument(
-        '-q',
-        '--quiet',
-        action='store_true',
-        help='don’t produce any output on standard output '
-        '(default: write output filenames to standard output)')
-    metadata_out_group.add_argument(
+    parser.add_argument('-q',
+                        '--quiet',
+                        action='store_true',
+                        help='don’t produce any output on standard output '
+                        '(default: write output filenames to standard output)')
+    parser.add_argument(
         '--csv',
         action='store_true',
         help='write arrival alert notice information to standard output in CSV '
@@ -770,25 +907,25 @@ def main(args):
     parser.add_argument('--text',
                         action='store_true',
                         help='include notice text in CSV (requires --csv)')
-    parser.add_argument('--text-ocr',
+    parser.add_argument('--ocr',
                         action='store_true',
                         help='use OCR to extract notice text if required '
                         '(requires --text)')
     parsed = parser.parse_args(args)
 
-    if not parsed.pdf_output and not parsed.csv:
-        parser.error('--no-pdf-output requires --csv')
+    if parsed.quiet and (parsed.csv or parsed.text):
+        parser.error('--quiet is incompatible with --csv and --text')
+    if not parsed.pdf_output and not (parsed.csv or parsed.text):
+        parser.error('--no-pdf-output requires --csv or --text')
     if not parsed.pdf_output and parsed.no_header_footer:
         parser.error('--no-pdf-output and --no-header-footer are incompatible')
-    if parsed.text and not parsed.csv:
-        parser.error('--csv-text requires --csv')
-    if parsed.text_ocr and not parsed.text:
-        parser.error('--csv-text-ocr requires --csv-text')
+    if parsed.ocr and not parsed.text:
+        parser.error('--ocr requires --text')
 
     callback = _Callback(quiet=parsed.quiet,
                          use_csv=parsed.csv,
                          text=parsed.text,
-                         text_ocr=parsed.text_ocr,
+                         ocr=parsed.ocr,
                          pdf_output=parsed.pdf_output)
 
     # Match both cover-to-cover volume and DCS “application data” rear matter
