@@ -687,7 +687,7 @@ def extract_text_from_cs_arrival_alert_notice(aan_pdf_page, *, allow_ocr=False):
         effective_from = None
         effective_to = None
 
-    email_match = re.search('For Inquiries: ([0-9a-z._-]+@[0-9a-z.-]+)\.?$',
+    email_match = re.search(r'For Inquiries: ([0-9a-z._-]+@[0-9a-z.-]+)\.?$',
                             text, re.IGNORECASE)
     if email_match is not None:
         email = email_match.group(1)
@@ -696,7 +696,7 @@ def extract_text_from_cs_arrival_alert_notice(aan_pdf_page, *, allow_ocr=False):
         email = None
 
     disclaimers_match = re.search(
-        'Not for navigation|For situational awareness', text, re.IGNORECASE)
+        r'Not for navigation|For situational awareness', text, re.IGNORECASE)
     if disclaimers_match is not None:
         disclaimers = text[disclaimers_match.start():].split('\n')
         text = text[:disclaimers_match.start()].rstrip(' \n')
