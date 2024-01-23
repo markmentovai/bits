@@ -210,9 +210,10 @@ def sucatalog_to_full_os_installers(session, sucatalog_urls):
                 if package_url.endswith(package_filenames):
                     package_urls.append(package_url)
 
-            build_match = re.match('(\d+)([A-Z])(\d+)([a-z])$', build, re.ASCII)
+            build_match = re.match(r'(\d+)([A-Z])(\d+)([a-z])$', build,
+                                   re.ASCII)
             if not build_match:
-                build_match = re.match('(\d+)([A-Z])(\d+)$', build, re.ASCII)
+                build_match = re.match(r'(\d+)([A-Z])(\d+)$', build, re.ASCII)
             build_comp = list(build_match.groups())
             build_comp[0] = int(build_comp[0])
             build_comp[2] = int(build_comp[2])
