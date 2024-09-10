@@ -99,19 +99,19 @@ def sucatalog_to_full_os_installers(session, sucatalog_urls):
     if (sucatalog_response.content[:2] == b'\x1f\x8b' and
             sucatalog_response_content_encoding is not None and
             sucatalog_response_content_encoding.lower() == 'x-gzip'):
-	# Before urllib3 2.1.0, Content-Encoding: x-gzip was not automatically
-	# decoded. urllib3/urllib3 issue 3174, pull request 3176, commit
-	# 5fc48e711b33. There were API changes between urllib3 1.x and 2.0 which may
-    # cause some installations to remain on the older version, so this code may
-	# conceivably run with urllib3 1.x, which does not handle x-gzip, and
-	# urllib3 2.1 or later, which do. Since urllib3’s behavior is unknown, sniff
-	# out the gzip magic and assume that it was not decoded if Content-Encoding:
-	# x-gzip is present. This is not a general solution (it’s not correct for
-	# gzipped content served with another layer of gzip via Content-Encoding),
-    # but it’ll do in this case, where the plist content will never validly
-    # begin with the gzip magic number.
-    #
-    # When urllib3 2.1 can be assured, this workaround can be removed.
+        # Before urllib3 2.1.0, Content-Encoding: x-gzip was not automatically
+        # decoded. urllib3/urllib3 issue 3174, pull request 3176, commit
+        # 5fc48e711b33. There were API changes between urllib3 1.x and 2.0 which
+        # may cause some installations to remain on the older version, so this
+        # code may conceivably run with urllib3 1.x, which does not handle
+        # x-gzip, and urllib3 2.1 or later, which do. Since urllib3’s behavior
+        # is unknown, sniff out the gzip magic and assume that it was not
+        # decoded if Content-Encoding: x-gzip is present. This is not a general
+        # solution (it’s not correct for gzipped content served with another
+        # layer of gzip via Content-Encoding), but it’ll do in this case, where
+        # the plist content will never validly begin with the gzip magic number.
+        #
+        # When urllib3 2.1 can be assured, this workaround can be removed.
         sucatalog_response_content = gzip.decompress(sucatalog_response.content)
     else:
         sucatalog_response_content = sucatalog_response.content
