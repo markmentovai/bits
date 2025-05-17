@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import argparse
+import collections.abc
 import datetime
 import gzip
 import lxml.etree
@@ -8,6 +9,7 @@ import plistlib
 import re
 import requests
 import sys
+import typing
 
 
 class FormatError(Exception):
@@ -16,7 +18,7 @@ class FormatError(Exception):
 
 # Returns the OS version as it appears in a sucatalog URL given its year of
 # release. Note that macOS 11 appears as 10.16 in sucatalog URLs.
-def _year_to_os_version(year):
+def _year_to_os_version(year: int) -> str:
     if year >= 2021:
         # macOS ≥ 12
         return str(year - 2009)
@@ -34,7 +36,12 @@ def _year_to_os_version(year):
 # https://stackoverflow.com/questions/51418142. This is used because the
 # arguments accepted by _year_to_os_version are “sparse” in that 2010 and 2008
 # are not accepted.
-def _try_iterate(callable, iterator, *exceptions, **kwargs):
+def _try_iterate(
+    callable: collections.abc.Callable[..., typing.Any],
+    iterator: collections.abc.Iterable[typing.Any],
+    *exceptions: type[BaseException],
+    **kwargs: typing.Any,
+) -> typing.Any:
     for element in iterator:
         try:
             yield callable(element, **kwargs)
@@ -48,7 +55,7 @@ def _try_iterate(callable, iterator, *exceptions, **kwargs):
 #
 # Example: in 2022, with track="seed", this returns
 # https://swscan.apple.com/content/catalogs/others/index-13seed-13-12-10.16-10.15-10.14-10.13-10.12-10.11-10.10-10.9-mountainlion-lion-snowleopard-leopard.merged-1.sucatalog.gz
-def _guess_sucatalog_url_for_year(year, track=None):
+def _guess_sucatalog_url_for_year(year: int, track: str | None = None) -> str:
     os_versions = list(
         _try_iterate(_year_to_os_version, range(year, 2006, -1), KeyError))
     if track is not None:
@@ -67,7 +74,8 @@ def _guess_sucatalog_url_for_year(year, track=None):
 # release, or expected OS release. In case the expected yearly OS release hasn’t
 # yet occurred for the current year, the second URL corresponds to the previous
 # year.
-def guess_sucatalog_urls(year=None, track=None):
+def guess_sucatalog_urls(year: int | None = None,
+                         track: str | None = None) -> tuple[str, ...]:
     if year is None:
         year = datetime.datetime.now().year
         return (_guess_sucatalog_url_for_year(year, track),
@@ -76,9 +84,12 @@ def guess_sucatalog_urls(year=None, track=None):
     return _guess_sucatalog_url_for_year(year, track),
 
 
-def sucatalog_to_full_os_installers(session, sucatalog_urls):
+def sucatalog_to_full_os_installers(
+        session: requests.Session,
+        sucatalog_urls: tuple[str, ...]) -> dict[str, dict[str, typing.Any]]:
     _LOCALIZATION_KEYS = ('English', 'en', 'en_US')
 
+    sucatalog_response = None
     for sucatalog_url in sucatalog_urls:
         sucatalog_response = session.get(sucatalog_url)
         try:
@@ -92,6 +103,7 @@ def sucatalog_to_full_os_installers(session, sucatalog_urls):
         # Success
         break
 
+    assert sucatalog_response is not None
     sucatalog_response.raise_for_status()
 
     sucatalog_response_content_encoding = sucatalog_response.headers.get(
@@ -127,27 +139,35 @@ def sucatalog_to_full_os_installers(session, sucatalog_urls):
                 'ExtendedMetaInfo', {}):
             post_date = product['PostDate']
 
+            localization_key = None
+            distribution_url = None
             for localization_key in _LOCALIZATION_KEYS:
                 distribution_url = product['Distributions'].get(
                     localization_key)
                 if distribution_url is not None:
                     break
 
+            assert localization_key is not None
+            assert distribution_url is not None
             distribution_response = session.get(distribution_url)
             distribution_response.raise_for_status()
 
             distribution_xml = lxml.etree.fromstring(
-                distribution_response.content)
+                distribution_response.content
+            )  # pyright: ignore[reportCallIssue]
             if distribution_xml.tag not in ('installer',
                                             'installer-gui-script'):
                 raise FormatError('distribution_xml.tag', distribution_xml.tag)
 
-            title = distribution_xml.find('title').text
+            title_xml = distribution_xml.find('title')
+            assert title_xml is not None
+            title = title_xml.text
             if title == 'SU_TITLE':
                 title = None
 
             distribution_auxinfo_dict_xml = distribution_xml.find(
                 'auxinfo/dict')
+            assert distribution_auxinfo_dict_xml is not None
             distribution_auxinfo_dict = {}
             key = None
             for element in distribution_auxinfo_dict_xml:
@@ -168,8 +188,9 @@ def sucatalog_to_full_os_installers(session, sucatalog_urls):
                 version = None
 
             build = distribution_auxinfo_dict['BUILD']
+            assert build is not None
 
-            package_filenames = ('InstallAssistant.pkg',)
+            package_filenames: tuple[str, ...] = ('InstallAssistant.pkg',)
 
             if title is None or version is None:
                 smd_response = session.get(product['ServerMetadataURL'])
@@ -178,6 +199,7 @@ def sucatalog_to_full_os_installers(session, sucatalog_urls):
                 smd_plist = plistlib.loads(smd_response.content)
 
                 version = smd_plist['CFBundleShortVersionString']
+                assert version is not None
                 title = smd_plist['localization'][localization_key]['title']
 
                 package_filenames = ('AppleDiagnostics.chunklist',
@@ -226,8 +248,9 @@ def sucatalog_to_full_os_installers(session, sucatalog_urls):
 
             build_match = re.match(r'(\d+)([A-Z])(\d+)([a-z])$', build,
                                    re.ASCII)
-            if not build_match:
+            if build_match is None:
                 build_match = re.match(r'(\d+)([A-Z])(\d+)$', build, re.ASCII)
+                assert build_match is not None
             build_comp = list(build_match.groups())
             build_comp[0] = int(build_comp[0])
             build_comp[2] = int(build_comp[2])
@@ -245,7 +268,7 @@ def sucatalog_to_full_os_installers(session, sucatalog_urls):
     return out_products
 
 
-def main(args):
+def main(args: list[str]) -> int | None:
     parser = argparse.ArgumentParser()
     parser_track_group = parser.add_mutually_exclusive_group()
     parser_track_group.add_argument('--track', default='seed')
@@ -270,6 +293,8 @@ def main(args):
                    product['post_date'].strftime('%Y-%m-%d'), product['title']))
             for package_url in product['package_urls']:
                 print('  %s' % package_url)
+
+    return None
 
 
 if __name__ == '__main__':

@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+import abc
 import argparse
 import io
 import lzma
@@ -8,13 +9,15 @@ import queue
 import struct
 import sys
 import threading
+import typing
 
 
 class FormatError(Exception):
     pass
 
 
-def _StructReadUnpack(file, format):
+def _StructReadUnpack(file: typing.BinaryIO,
+                      format: str) -> tuple[typing.Any, ...]:
     s = struct.Struct(format)
 
     data = file.read(s.size)
@@ -24,16 +27,23 @@ def _StructReadUnpack(file, format):
     return s.unpack(data)
 
 
-class _LimitedInputSizeReader(io.RawIOBase):
+class _LimitedReaderBase(io.RawIOBase):
 
-    def __init__(self, source, size):
+    @abc.abstractmethod
+    def CheckFinished(self) -> None:
+        ...
+
+
+class _LimitedInputSizeReader(_LimitedReaderBase):
+
+    def __init__(self, source: typing.BinaryIO, size: int):
         self._source = source
         self._size = size
 
-    def readable(self):
+    def readable(self) -> bool:
         return True
 
-    def read(self, size=-1):
+    def read(self, size: int = -1) -> bytes:
         self._checkClosed()
 
         if size is None or size < 0:
@@ -44,22 +54,23 @@ class _LimitedInputSizeReader(io.RawIOBase):
         self._size -= len(output)
         return output
 
-    def CheckFinished(self):
+    @typing.override
+    def CheckFinished(self) -> None:
         if self._size != 0:
             raise FormatError('unconsumed data')
 
 
-class _ExactOutputSizeReader(io.RawIOBase):
+class _ExactOutputSizeReader(_LimitedReaderBase):
 
-    def __init__(self, source, size):
+    def __init__(self, source: _LimitedReaderBase, size: int):
         self._source = source
         self._size = size
         self._eof = False
 
-    def readable(self):
+    def readable(self) -> bool:
         return True
 
-    def read(self, size=-1):
+    def read(self, size: int = -1) -> bytes:
         self._checkClosed()
 
         if size is None or size < 0:
@@ -73,7 +84,8 @@ class _ExactOutputSizeReader(io.RawIOBase):
 
         return output
 
-    def CheckFinished(self):
+    @typing.override
+    def CheckFinished(self) -> None:
         if self._eof and self._size > 0:
             raise FormatError('unconsumed data')
 
@@ -83,16 +95,17 @@ class _ExactOutputSizeReader(io.RawIOBase):
         self._source.CheckFinished()
 
 
-class LZMAReader(io.RawIOBase):
+class LZMAReader(_LimitedReaderBase):
 
-    def __init__(self, source, *args, **kwargs):
+    def __init__(self, source: _LimitedReaderBase | io.BytesIO, *args:
+                 typing.Any, **kwargs: typing.Any):
         self._source = source
         self._decompressor = lzma.LZMADecompressor(*args, **kwargs)
 
-    def readable(self):
+    def readable(self) -> bool:
         return True
 
-    def read(self, size=-1):
+    def read(self, size: int = -1) -> bytes:
         self._checkClosed()
 
         if size is None or size < 0:
@@ -112,7 +125,8 @@ class LZMAReader(io.RawIOBase):
 
         return output
 
-    def CheckFinished(self):
+    @typing.override
+    def CheckFinished(self) -> None:
         if not self._decompressor.eof:
             raise FormatError('unterminated LZMA stream')
         if self._decompressor.unused_data != b'':
@@ -120,13 +134,13 @@ class LZMAReader(io.RawIOBase):
 
         # self._source may be io.BytesIO, which does not implement
         # CheckFinished.
-        if callable(getattr(self._source, 'CheckFinished', None)):
+        if isinstance(self._source, _LimitedReaderBase):
             self._source.CheckFinished()
 
 
 class _PBZXBlockSegmenter:
 
-    def __init__(self, file, decompress=True):
+    def __init__(self, file: typing.BinaryIO, decompress: bool = True):
         self._file = file
         self._decompress = decompress
         self._block_decompressed_size = None
@@ -136,14 +150,16 @@ class _PBZXBlockSegmenter:
         if magic != b'pbzx':
             raise FormatError('not pbzx')
 
-    def __iter__(self):
+    def __iter__(self) -> typing.Iterator[tuple[_LimitedReaderBase, bool, int]]:
         return self
 
-    def __next__(self):
+    def __next__(self) -> tuple[_LimitedReaderBase, bool, int]:
         old_block_decompressed_size = self._block_decompressed_size
         try:
             (self._block_decompressed_size,
              block_compressed_size) = _StructReadUnpack(self._file, '>QQ')
+            assert isinstance(self._block_decompressed_size, int)
+            assert isinstance(block_compressed_size, int)
         except EOFError:
             raise StopIteration
 
@@ -156,8 +172,8 @@ class _PBZXBlockSegmenter:
         # Since there's a new block, the previous block, if any, was not the
         # final block.
         if (old_block_decompressed_size is not None and
-                old_block_decompressed_size !=
-                self._base_block_decompressed_size):
+            (old_block_decompressed_size
+             != self._base_block_decompressed_size)):
             raise FormatError(
                 'non-final block size does not match base block size')
 
@@ -168,7 +184,7 @@ class _PBZXBlockSegmenter:
         limited_size_reader = _LimitedInputSizeReader(self._file,
                                                       block_compressed_size)
         if compressed and self._decompress:
-            block_reader = LZMAReader(limited_size_reader)
+            block_reader: _LimitedReaderBase = LZMAReader(limited_size_reader)
         else:
             block_reader = limited_size_reader
 
@@ -177,15 +193,15 @@ class _PBZXBlockSegmenter:
 
 class PBZXReader(io.RawIOBase):
 
-    def __init__(self, source):
+    def __init__(self, source: typing.BinaryIO):
         self._pbzx_blocks = iter(_PBZXBlockSegmenter(source))
         self._eof = False
-        self._block_reader = None
+        self._block_reader: _ExactOutputSizeReader | None = None
 
-    def readable(self):
+    def readable(self) -> bool:
         return True
 
-    def read(self, size=-1):
+    def read(self, size: int = -1) -> bytes:
         self._checkClosed()
 
         if size is None or size < 0:
@@ -211,7 +227,10 @@ class PBZXReader(io.RawIOBase):
         return output
 
 
-def _PBZXDecompressThread(input_queue, output_queue):
+def _PBZXDecompressThread(
+    input_queue: queue.Queue[tuple[int, _ExactOutputSizeReader] | None],
+    output_queue: queue.Queue[tuple[int, bytes]],
+) -> None:
     while True:
         item = input_queue.get()
         if item is None:
@@ -227,7 +246,9 @@ def _PBZXDecompressThread(input_queue, output_queue):
         input_queue.task_done()
 
 
-def PBZXCat(in_file, out_file, max_threads=None):
+def PBZXCat(in_file: typing.BinaryIO,
+            out_file: typing.BinaryIO,
+            max_threads: int | None = None) -> None:
     if max_threads == 1:
         lzma_reader = PBZXReader(in_file)
         while True:
@@ -240,21 +261,24 @@ def PBZXCat(in_file, out_file, max_threads=None):
 
     if max_threads is None:
         try:
-            max_threads = len(os.sched_getaffinity(0))
+            max_threads = len(
+                os.sched_getaffinity(0))  # type: ignore[attr-defined]
         except AttributeError:
             max_threads = os.cpu_count()
+        assert max_threads is not None
 
     pbzx_blocks = iter(_PBZXBlockSegmenter(in_file, False))
 
     # TODO: the whole rest of this function can be tightened up.
-    input_queue = queue.Queue(max_threads)
-    output_queue = queue.Queue()
+    input_queue: queue.Queue[tuple[int, _ExactOutputSizeReader] |
+                             None] = (queue.Queue(max_threads))
+    output_queue: queue.Queue[tuple[int, bytes]] = queue.Queue()
 
-    threads = []
+    threads: list[threading.Thread] = []
 
     pending_input = None
     input_block_sequence = 0
-    pending_output = []
+    pending_output: list[bytes | None] = []
     output_block_sequence = 0
     output_eof = False
     input_eof = False
@@ -307,7 +331,8 @@ def PBZXCat(in_file, out_file, max_threads=None):
 
         while output_block_sequence < len(pending_output) and pending_output[
                 output_block_sequence] is not None:
-            out_file.write(pending_output[output_block_sequence])
+            out_file.write(
+                pending_output[output_block_sequence])  # type: ignore[arg-type]
             pending_output[output_block_sequence] = None
             output_block_sequence += 1
             if input_eof and output_block_sequence == input_block_sequence:
@@ -322,11 +347,11 @@ def PBZXCat(in_file, out_file, max_threads=None):
         thread.join()
 
 
-def main(args):
+def main(args: list[str]) -> int | None:
     parser = argparse.ArgumentParser()
     parser.add_argument('--force', '-f', action='store_true')
     parser.add_argument('file', nargs='*')
-    parsed = parser.parse_args()
+    parsed = parser.parse_args(args)
 
     if len(parsed.file) == 0:
         if not parsed.force and sys.stdin.isatty():
@@ -339,7 +364,7 @@ def main(args):
             with open(path, 'rb') as file:
                 PBZXCat(file, sys.stdout.buffer)
 
-    return 0
+    return None
 
 
 if __name__ == '__main__':
