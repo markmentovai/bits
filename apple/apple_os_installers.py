@@ -21,6 +21,9 @@ class FormatError(Exception):
 # Returns the OS version as it appears in a sucatalog URL given its year of
 # release. Note that macOS 11 appears as 10.16 in sucatalog URLs.
 def _year_to_os_version(year: int) -> str:
+    if year >= 2025:
+        # macOS ≥ 26
+        return str(year - 1999)
     if year >= 2021:
         # macOS ≥ 12
         return str(year - 2009)
@@ -60,6 +63,10 @@ def _try_iterate(
 def _guess_sucatalog_url_for_year(year: int, track: str | None = None) -> str:
     os_versions = list(
         _try_iterate(_year_to_os_version, range(year, 2006, -1), KeyError))
+    if year == 2025 and track == 'beta':
+        # For the beta track (but not the seed track), macOS 26 is represented
+        # by “16” in the sucatalog URL.
+        os_versions[0] = '16'
     if track is not None:
         os_versions.insert(0, os_versions[0] + track)
     os_versions_string = '-'.join(os_versions)
