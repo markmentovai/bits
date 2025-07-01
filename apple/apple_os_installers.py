@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 
+# pyright: strict
+
 import argparse
 import collections.abc
 import datetime
@@ -133,7 +135,7 @@ def sucatalog_to_full_os_installers(
     if sucatalog_plist['CatalogVersion'] != 2:
         raise FormatError('CatalogVersion', sucatalog_plist['CatalogVersion'])
 
-    out_products = {}
+    out_products: dict[str, dict[str, typing.Any]] = {}
     for product_key, product in sucatalog_plist.get('Products', {}).items():
         if 'InstallAssistantPackageIdentifiers' in product.get(
                 'ExtendedMetaInfo', {}):
@@ -168,7 +170,7 @@ def sucatalog_to_full_os_installers(
             distribution_auxinfo_dict_xml = distribution_xml.find(
                 'auxinfo/dict')
             assert distribution_auxinfo_dict_xml is not None
-            distribution_auxinfo_dict = {}
+            distribution_auxinfo_dict: dict[str, str] = {}
             key = None
             for element in distribution_auxinfo_dict_xml:
                 if key is None:
@@ -178,12 +180,13 @@ def sucatalog_to_full_os_installers(
                 else:
                     if element.tag != 'string':
                         raise FormatError('element.tag', element.tag)
+                    assert element.text is not None
                     distribution_auxinfo_dict[key] = element.text
                     key = None
             if key is not None:
                 raise FormatError('key', key)
 
-            version = distribution_auxinfo_dict['VERSION']
+            version: str | None = distribution_auxinfo_dict['VERSION']
             if version == 'SU_VERSION':
                 version = None
 
@@ -208,7 +211,7 @@ def sucatalog_to_full_os_installers(
                                      'InstallAssistantAuto.pkg',
                                      'InstallESDDmg.pkg')
 
-            package_urls = []
+            package_urls: list[str] = []
             for package in product['Packages']:
                 package_url = package['URL']
                 # TODO: Fish the list of packages out of distribution's
