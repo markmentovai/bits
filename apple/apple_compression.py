@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import abc
 import argparse
 import ctypes
 import enum
@@ -110,8 +111,6 @@ def _buf_to_mutable_char_p_and_size(
 
 
 class _Compression:
-    _instance = None
-
     __slots__ = (
         '_lib',
         '_encode_scratch_buffer_size',
@@ -216,12 +215,6 @@ class _Compression:
             ((1, 'stream'),),
         )
 
-    @classmethod
-    def get(cls) -> _Compression:
-        if cls._instance is None:
-            cls._instance = cls()
-        return cls._instance
-
     def encode_scratch_buffer_size(self, algorithm: Algorithm) -> int:
         result = self._encode_scratch_buffer_size(algorithm.value)
         assert isinstance(result, int)
@@ -307,26 +300,29 @@ class _Compression:
         assert status == _Status.OK
 
 
+_compression = _Compression()
+
+
 def compress_scratch_buffer_size(algorithm: Algorithm) -> int:
-    return _Compression.get().encode_scratch_buffer_size(algorithm)
+    return _compression.encode_scratch_buffer_size(algorithm)
 
 
 def _compress_buffer_internal(
         decompressed: bytes | bytearray | memoryview,
         algorithm: Algorithm,
         size: int,
-        scratch_buffer: bytearray | memoryview | None = None) -> memoryview:
+        scratch_buffer: bytearray | memoryview | None = None) -> bytes:
     buffer = bytearray(size)
-    return _Compression.get().encode_buffer(buffer, decompressed, algorithm,
-                                            scratch_buffer)
+    return bytes(
+        _compression.encode_buffer(buffer, decompressed, algorithm,
+                                   scratch_buffer))
 
 
-def compress_buffer(
-        decompressed: bytes | bytearray | memoryview,
-        algorithm: Algorithm,
-        *,
-        max_size: int | None = None,
-        scratch_buffer: bytearray | memoryview | None = None) -> memoryview:
+def compress(decompressed: bytes | bytearray | memoryview,
+             algorithm: Algorithm,
+             *,
+             max_size: int | None = None,
+             scratch_buffer: bytearray | memoryview | None = None) -> bytes:
     if max_size is not None:
         return _compress_buffer_internal(decompressed, algorithm, max_size,
                                          scratch_buffer)
@@ -342,25 +338,25 @@ def compress_buffer(
 
 
 def decompress_scratch_buffer_size(algorithm: Algorithm) -> int:
-    return _Compression.get().decode_scratch_buffer_size(algorithm)
+    return _compression.decode_scratch_buffer_size(algorithm)
 
 
 def _decompress_buffer_internal(
         compressed: bytes | bytearray | memoryview,
         algorithm: Algorithm,
         size: int,
-        scratch_buffer: bytearray | memoryview | None = None) -> memoryview:
+        scratch_buffer: bytearray | memoryview | None = None) -> bytes:
     buffer = bytearray(size)
-    return _Compression.get().decode_buffer(buffer, compressed, algorithm,
-                                            scratch_buffer)
+    return bytes(
+        _compression.decode_buffer(buffer, compressed, algorithm,
+                                   scratch_buffer))
 
 
-def decompress_buffer(
-        compressed: bytes | bytearray | memoryview,
-        algorithm: Algorithm,
-        *,
-        max_size: int | None = None,
-        scratch_buffer: bytearray | memoryview | None = None) -> memoryview:
+def decompress(compressed: bytes | bytearray | memoryview,
+               algorithm: Algorithm,
+               *,
+               max_size: int | None = None,
+               scratch_buffer: bytearray | memoryview | None = None) -> bytes:
     if max_size is not None:
         decompressed = _decompress_buffer_internal(compressed, algorithm,
                                                    max_size + 1, scratch_buffer)
@@ -378,32 +374,24 @@ def decompress_buffer(
             return decompressed
 
 
-class _CompressDecompressStream:
+class _CompressDecompressStream(abc.ABC):
     __slots__ = (
         '_stream',
-        '_output_buffer',
-        '_output_block_size',
         '_input_eof',
         '_stream_eof',
     )
 
-    def __init__(self,
-                 operation: _StreamOperation,
-                 algorithm: Algorithm,
-                 *,
-                 output_block_size: int | None = None):
+    def __init__(self, operation: _StreamOperation, algorithm: Algorithm):
         self._stream: _CompressionStream | None = _CompressionStream()
-        self._output_buffer: bytearray | None = None
-        self._output_block_size = output_block_size
         self._input_eof = False
         self._stream_eof = False
 
-        _Compression.get().stream_init(self._stream, operation, algorithm)
+        _compression.stream_init(self._stream, operation, algorithm)
 
     def __del__(self) -> None:
         self._close()
 
-    def __enter__(self) -> _CompressDecompressStream:
+    def __enter__(self) -> typing.Self:
         return self
 
     def __exit__(
@@ -417,24 +405,28 @@ class _CompressDecompressStream:
 
     def _close(self) -> None:
         if self._stream is not None:
-            _Compression.get().stream_destroy(self._stream)
+            _compression.stream_destroy(self._stream)
             self._stream = None
 
-    def write(self,
-              data: bytes | bytearray | memoryview,
-              *,
-              eof: bool = False) -> int:
-        if self._input_eof:
-            raise ValueError('write called after eof')
+    def _process(self,
+                 data: bytes | bytearray | memoryview,
+                 *,
+                 eof: bool = False,
+                 output_buffer_size: int | None = None) -> bytes:
+        assert not self._input_eof
+        if self._stream_eof:
+            raise EOFError('Already at end of stream')
+
         assert self._stream is not None
         self._input_eof = eof
 
         (self._stream.src_ptr,
          self._stream.src_size) = _buf_to_const_char_p_and_size(data)
 
-        output_buffer = bytearray(
-            self._output_block_size if self.
-            _output_block_size is not None else max(2 * len(data), 64 * 1024))
+        result_ba = bytearray()
+        output_buffer = bytearray(output_buffer_size if output_buffer_size
+                                  is not None else max(2 * len(data), 64 *
+                                                       1024))
         status = _Status.ERROR
         while not self._stream_eof and (self._stream.src_size != 0 or eof):
             (
@@ -442,7 +434,7 @@ class _CompressDecompressStream:
                 self._stream.dst_size,
             ) = _buf_to_mutable_char_p_and_size(output_buffer)
 
-            status = _Compression.get().stream_process(
+            status = _compression.stream_process(
                 self._stream,
                 _StreamFlags.FINALIZE if eof else _StreamFlags.NONE)
             if status == _Status.ERROR:
@@ -451,63 +443,103 @@ class _CompressDecompressStream:
             if status == _Status.END:
                 self._stream_eof = True
 
-            output_produced = memoryview(output_buffer)
+            process_output_produced = memoryview(output_buffer)
             if self._stream.dst_size != 0:
-                output_produced = output_produced[:-self._stream.dst_size]
+                process_output_produced = (
+                    process_output_produced[:-self._stream.dst_size])
 
-            if len(output_produced) != 0:
-                if self._output_buffer is None:
-                    self._output_buffer = bytearray()
-                self._output_buffer.extend(output_produced)
+            result_ba.extend(process_output_produced)
 
         # In practice, compression_stream_process reports consuming the entire
         # buffer, even when decompressing and there is data beyond the
         # end-of-stream marker. (It doesn’t actually decompress anything beyond
-        # the end of stream.)
-        assert isinstance(self._stream.src_size, int)
-        result = len(data) - self._stream.src_size
+        # the end of stream.) But this means that there’s no point in trying to
+        # keep track of unused_data.
 
-        if eof:
+        if self._input_eof or self._stream_eof:
             self._close()
+
+        return bytes(result_ba)
+
+    @abc.abstractmethod
+    def process(self, data: bytes) -> bytes:
+        ...
+
+    @abc.abstractmethod
+    def flush(self) -> bytes:
+        ...
+
+
+class Compressor(_CompressDecompressStream):
+
+    def __init__(self, algorithm: Algorithm):
+        super().__init__(_StreamOperation.ENCODE, algorithm)
+
+    def compress(self, data: bytes) -> bytes:
+        if self._input_eof:
+            raise ValueError('Compressor has been flushed')
+
+        return self._process(data)
+
+    @typing.override
+    def process(self, data: bytes) -> bytes:
+        return self.compress(data)
+
+    @typing.override
+    def flush(self) -> bytes:
+        if self._input_eof:
+            raise ValueError('Repeated call to flush()')
+
+        return self._process(b'', eof=True)
+
+
+class Decompressor(_CompressDecompressStream):
+    __slots__ = ('_decompressed')
+
+    def __init__(self, algorithm: Algorithm):
+        super().__init__(_StreamOperation.DECODE, algorithm)
+        self._decompressed = bytearray()
+
+    def decompress(self, data: bytes, max_length: int = -1) -> bytes:
+        if self._input_eof:
+            raise ValueError('Decompressor has been flushed')
+
+        decompressed = self._process(data)
+        if (len(self._decompressed) == 0 and
+            (max_length < 0 or max_length >= len(decompressed))):
+            result = decompressed
+        else:
+            self._decompressed.extend(decompressed)
+
+            if max_length < 0 or max_length >= len(self._decompressed):
+                result = bytes(self._decompressed)
+                self._decompressed.clear()
+            else:
+                result = bytes(self._decompressed[:max_length])
+                self._decompressed = self._decompressed[max_length:]
 
         return result
 
-    def read(self, size: int | None = -1) -> bytes:
-        if self._output_buffer is None:
-            return b''
+    @typing.override
+    def process(self, data: bytes) -> bytes:
+        return self.decompress(data)
 
-        if size is None or size < 0:
-            result = self._output_buffer
-            self._output_buffer = None
-        else:
-            result = self._output_buffer[:size]
-            self._output_buffer = self._output_buffer[len(result):]
-            if len(self._output_buffer) == 0:
-                self._output_buffer = None
+    @typing.override
+    def flush(self) -> bytes:
+        if self._stream_eof:
+            result = bytes(self._decompressed)
+            self._decompressed.clear()
+            return result
 
-        return bytes(result)
+        return self._process(b'', eof=True)
 
+    @property
+    def eof(self) -> bool:
+        return self._stream_eof and len(self._decompressed) == 0
 
-class CompressStream(_CompressDecompressStream):
-
-    def __init__(self,
-                 algorithm: Algorithm,
-                 *,
-                 output_block_size: int | None = None):
-        super().__init__(_StreamOperation.ENCODE,
-                         algorithm,
-                         output_block_size=output_block_size)
-
-
-class DecompressStream(_CompressDecompressStream):
-
-    def __init__(self,
-                 algorithm: Algorithm,
-                 *,
-                 output_block_size: int | None = None):
-        super().__init__(_StreamOperation.DECODE,
-                         algorithm,
-                         output_block_size=output_block_size)
+    @property
+    def needs_input(self) -> bool:
+        return not self._stream_eof and len(self._decompressed) == 0
 
 
 class _Interface(enum.Enum):
@@ -546,9 +578,9 @@ def main(args: typing.Sequence[str]) -> int | None:
                         help='output file, if not stdout')
     parsed = parser.parse_args(args)
 
-    mode = {
-        'compress': _StreamOperation.ENCODE,
-        'decompress': _StreamOperation.DECODE,
+    (compress_decompress_function, compressor_decompressor_class) = {
+        'compress': (compress, Compressor),
+        'decompress': (decompress, Decompressor),
     }[parsed.mode]
 
     algorithm = {
@@ -582,35 +614,22 @@ def main(args: typing.Sequence[str]) -> int | None:
     ):
         if interface == _Interface.BUFFER:
             input = input_file.read()
+            output = compress_decompress_function(input, algorithm)
+            output_file.write(output)
+        else:
+            assert interface == _Interface.STREAM
+            with compressor_decompressor_class(algorithm) as stream:
+                eof = False
+                while not eof:
+                    input = input_file.read(64 * 1024)
 
-            if mode == _StreamOperation.ENCODE:
-                output_buffer = compress_buffer(input, algorithm)
-            else:
-                output_buffer = decompress_buffer(input, algorithm)
+                    if len(input) != 0:
+                        output = stream.process(input)
+                    else:
+                        eof = True
+                        output = stream.flush()
 
-            written = output_file.write(output_buffer)
-            assert written == len(output_buffer)
-
-            return None
-
-        with {
-                _StreamOperation.ENCODE: CompressStream,
-                _StreamOperation.DECODE: DecompressStream,
-        }[mode](algorithm) as stream:
-            eof = False
-            while not eof:
-                input = input_file.read(64 * 1024)
-                eof = len(input) == 0
-
-                written = stream.write(input, eof=eof)
-                assert written == len(input)
-
-                output = stream.read()
-
-                written = output_file.write(output)
-                assert written == len(output)
-
-            assert len(stream.read()) == 0
+                    output_file.write(output)
 
     return None
 
