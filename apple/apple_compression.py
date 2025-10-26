@@ -428,7 +428,10 @@ class _CompressDecompressStream(abc.ABC):
                                   is not None else max(2 * len(data), 64 *
                                                        1024))
         status = _Status.ERROR
-        while not self._stream_eof and (self._stream.src_size != 0 or eof):
+        ran_loop = False
+        while (not self._stream_eof and
+               (not ran_loop or self._stream.src_size != 0 or eof)):
+            ran_loop = True
             (
                 self._stream.dst_ptr,
                 self._stream.dst_size,
@@ -462,7 +465,7 @@ class _CompressDecompressStream(abc.ABC):
         return bytes(result_ba)
 
     @abc.abstractmethod
-    def process(self, data: bytes) -> bytes:
+    def process(self, data: bytes | bytearray | memoryview) -> bytes:
         ...
 
     @abc.abstractmethod
@@ -475,14 +478,14 @@ class Compressor(_CompressDecompressStream):
     def __init__(self, algorithm: Algorithm):
         super().__init__(_StreamOperation.ENCODE, algorithm)
 
-    def compress(self, data: bytes) -> bytes:
+    def compress(self, data: bytes | bytearray | memoryview) -> bytes:
         if self._input_eof:
             raise ValueError('Compressor has been flushed')
 
         return self._process(data)
 
     @typing.override
-    def process(self, data: bytes) -> bytes:
+    def process(self, data: bytes | bytearray | memoryview) -> bytes:
         return self.compress(data)
 
     @typing.override
@@ -500,11 +503,17 @@ class Decompressor(_CompressDecompressStream):
         super().__init__(_StreamOperation.DECODE, algorithm)
         self._decompressed = bytearray()
 
-    def decompress(self, data: bytes, max_length: int = -1) -> bytes:
+    def decompress(self,
+                   data: bytes | bytearray | memoryview,
+                   max_length: int = -1) -> bytes:
         if self._input_eof:
             raise ValueError('Decompressor has been flushed')
 
-        decompressed = self._process(data)
+        if data != b'' or not self._stream_eof:
+            decompressed = self._process(data)
+        else:
+            decompressed = b''
+
         if (len(self._decompressed) == 0 and
             (max_length < 0 or max_length >= len(decompressed))):
             result = decompressed
@@ -521,17 +530,18 @@ class Decompressor(_CompressDecompressStream):
         return result
 
     @typing.override
-    def process(self, data: bytes) -> bytes:
+    def process(self, data: bytes | bytearray | memoryview) -> bytes:
         return self.decompress(data)
 
     @typing.override
     def flush(self) -> bytes:
-        if self._stream_eof:
-            result = bytes(self._decompressed)
-            self._decompressed.clear()
-            return result
+        decompressed = bytes(self._decompressed)
+        self._decompressed.clear()
 
-        return self._process(b'', eof=True)
+        if self._stream_eof:
+            return decompressed
+
+        return decompressed + self._process(b'', eof=True)
 
     @property
     def eof(self) -> bool:

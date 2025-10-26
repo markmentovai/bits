@@ -134,6 +134,9 @@ _compressed_incompressible = {
                         'b9kGAAAAAAA=',
 }
 
+_InputTypes = typing.Type[bytes | bytearray | memoryview]
+_input_types = typing.get_args(typing.get_args(_InputTypes)[0])
+
 
 # compress can’t distinguish between an error and a compression operation that
 # doesn’t produce output.
@@ -154,7 +157,8 @@ def test_buffer_decompress_nul(algorithm: Algorithm) -> None:
     assert decompressed == b'\x00'
 
 
-# For some reason, Brotli produces an error using the buffer interface.
+# For some reason, decompression produces an error using the buffer interface
+# with this compressible data using Brotli.
 @pytest.mark.parametrize('algorithm',
                          (algorithm if algorithm != Algorithm.BROTLI else
                           pytest.param(algorithm, marks=pytest.mark.xfail)
@@ -172,27 +176,54 @@ def test_buffer_decompress_incompressible(algorithm: Algorithm) -> None:
     assert decompressed == _incompressible_compressed
 
 
-def _test_buffer_roundtrip(algorithm: Algorithm, data: bytes) -> None:
-    compressed = compress(data, algorithm)
-    decompressed = decompress(compressed, algorithm)
+@pytest.mark.parametrize('algorithm', Algorithm)
+def test_buffer_decompress_sized(algorithm: Algorithm) -> None:
+    compressed = base64.b64decode(_compressed_incompressible[algorithm])
+    decompressed = decompress(compressed,
+                              algorithm,
+                              max_size=len(_incompressible_compressed))
+    assert decompressed == _incompressible_compressed
+
+
+@pytest.mark.parametrize('algorithm', Algorithm)
+def test_buffer_decompress_sized_overflow(algorithm: Algorithm) -> None:
+    compressed = base64.b64decode(_compressed_incompressible[algorithm])
+    with pytest.raises(CompressionError):
+        decompress(compressed,
+                   algorithm,
+                   max_size=len(_incompressible_compressed) - 1)
+
+
+def _test_buffer_roundtrip(algorithm: Algorithm, data: bytes,
+                           input_type: _InputTypes) -> None:
+    data_t = input_type(data) if input_type is not bytes else data
+    compressed = compress(data_t, algorithm)
+    compressed_t = (input_type(compressed)
+                    if input_type is not bytes else compressed)
+    decompressed = decompress(compressed_t, algorithm)
     assert decompressed == data
 
 
 @pytest.mark.parametrize('algorithm', Algorithm)
-def test_buffer_roundtrip_nul(algorithm: Algorithm) -> None:
-    _test_buffer_roundtrip(algorithm, b'\x00')
+@pytest.mark.parametrize('input_type', _input_types)
+def test_buffer_roundtrip_nul(algorithm: Algorithm,
+                              input_type: _InputTypes) -> None:
+    _test_buffer_roundtrip(algorithm, b'\x00', input_type)
 
 
 # For some reason, decompression produces an error using the buffer interface
-# with compressible data using LZMA or Brotli.
+# with this compressible data using LZMA or Brotli.
 @pytest.mark.parametrize(
     'algorithm',
     (algorithm if algorithm not in (Algorithm.LZMA, Algorithm.BROTLI) else
      pytest.param(algorithm, marks=pytest.mark.xfail)
      for algorithm in Algorithm))
-def test_buffer_roundtrip_compressible(algorithm: Algorithm) -> None:
+@pytest.mark.parametrize('input_type', _input_types)
+def test_buffer_roundtrip_compressible(algorithm: Algorithm,
+                                       input_type: _InputTypes) -> None:
     _test_buffer_roundtrip(algorithm,
-                           b''.join(c.to_bytes() for c in range(256)) * 4096)
+                           b''.join(c.to_bytes() for c in range(256)) * 4096,
+                           input_type)
 
 
 # This will almost certainly work with LZMA and Brotli, but because the data is
@@ -205,8 +236,88 @@ def test_buffer_roundtrip_compressible(algorithm: Algorithm) -> None:
     (algorithm if algorithm not in (Algorithm.LZMA, Algorithm.BROTLI) else
      pytest.param(algorithm, marks=pytest.mark.skip)
      for algorithm in Algorithm))
-def test_buffer_roundtrip_random(algorithm: Algorithm) -> None:
-    _test_buffer_roundtrip(algorithm, random.randbytes(1024 * 1024))
+@pytest.mark.parametrize('input_type', _input_types)
+def test_buffer_roundtrip_random(algorithm: Algorithm,
+                                 input_type: _InputTypes) -> None:
+    _test_buffer_roundtrip(algorithm, random.randbytes(1024 * 1024), input_type)
+
+
+# Skip LZMA and Brotli for the same reason as in test_buffer_roundtrip_random.
+@pytest.mark.parametrize(
+    'algorithm',
+    (algorithm if algorithm not in (Algorithm.LZMA, Algorithm.BROTLI) else
+     pytest.param(algorithm, marks=pytest.mark.skip)
+     for algorithm in Algorithm))
+@pytest.mark.parametrize('input_type', _input_types)
+def test_buffer_roundtrip_scratch(algorithm: Algorithm,
+                                  input_type: _InputTypes) -> None:
+    compress_scratch_size = compress_scratch_buffer_size(algorithm)
+    assert compress_scratch_size >= 0
+    decompress_scratch_size = decompress_scratch_buffer_size(algorithm)
+    assert decompress_scratch_size >= 0
+
+    data = random.randbytes(1024 * 1024)
+
+    data_t = input_type(data) if input_type is not bytes else data
+    compress_scratch_buffer = bytearray(compress_scratch_size)
+    compress_scratch_buffer_t = (memoryview(compress_scratch_buffer)
+                                 if input_type is memoryview else
+                                 compress_scratch_buffer)
+    compressed = compress(data_t,
+                          algorithm,
+                          scratch_buffer=compress_scratch_buffer_t)
+    compressed_without_scratch = compress(data, algorithm)
+    assert compressed == compressed_without_scratch
+
+    compressed_t = (input_type(compressed)
+                    if input_type is not bytes else compressed)
+    decompress_scratch_buffer = bytearray(decompress_scratch_size)
+    decompress_scratch_buffer_t = (memoryview(decompress_scratch_buffer)
+                                   if input_type is memoryview else
+                                   decompress_scratch_buffer)
+    decompressed = decompress(compressed_t,
+                              algorithm,
+                              scratch_buffer=decompress_scratch_buffer_t)
+    assert decompressed == data
+
+
+# This test fails for some algorithms: compressing with zlib wants a max_size 1
+# byte larger than will be populated; LZBITMAP needs somewhat more.
+@pytest.mark.parametrize('algorithm', (algorithm if algorithm not in (
+    Algorithm.ZLIB,
+    Algorithm.LZBITMAP,
+) else pytest.param(algorithm, marks=pytest.mark.xfail)
+                                       for algorithm in Algorithm))
+def test_buffer_compress_sized(algorithm: Algorithm) -> None:
+    data = random.randbytes(1024 * 1024)
+    compressed = compress(data, algorithm)
+    compressed_sized = compress(data, algorithm, max_size=len(compressed))
+
+    # LZFSE is weird: the implementation seems to compress more tightly when
+    # given a smaller buffer. This means that `compressed` and `compressed_size`
+    # may not be equal, but at least it’s possible to test that
+    # `compressed_sized` decompresses properly.
+    if algorithm != Algorithm.LZFSE:
+        assert compressed == compressed_sized
+
+    decompressed = decompress(compressed_sized, algorithm)
+    assert decompressed == data
+
+
+@pytest.mark.parametrize('algorithm', Algorithm)
+def test_buffer_compress_sized_overflow(algorithm: Algorithm) -> None:
+    data = random.randbytes(1024 * 1024)
+    compressed = compress(data, algorithm)
+
+    # LZFSE is weird: the implementation seems to compress more tightly when
+    # given a smaller buffer. That means that undersizing the buffer by 1 byte
+    # isn’t enough to trigger a CompressionError. Instead, undersize it by 2.5%,
+    # which seems more than sufficient to trigger the error.
+    max_size = (round(.975 * len(compressed))
+                if algorithm == Algorithm.LZFSE else len(compressed) - 1)
+
+    with pytest.raises(CompressionError):
+        compress(data, algorithm, max_size=max_size)
 
 
 @pytest.mark.parametrize('algorithm', _interoperable_algorithms.keys())
@@ -238,6 +349,7 @@ def _test_stream_decompress(
         assert decompressor.needs_input
         decompressed = decompressor.decompress(compressed)
         decompressed += decompressor.flush()
+        assert decompressor.flush() == b''
         assert decompressed == expect
         assert decompressor.eof
         assert not decompressor.needs_input
@@ -276,16 +388,23 @@ def test_stream_decompress_incompressible(algorithm: Algorithm) -> None:
                             _incompressible_compressed)
 
 
-def _test_stream_roundtrip(algorithm: Algorithm, data: bytes) -> None:
+def _test_stream_roundtrip(algorithm: Algorithm, data: bytes,
+                           input_type: _InputTypes) -> None:
+    data_t = input_type(data) if input_type is not bytes else data
+
     with Compressor(algorithm) as compressor:
-        compressed = compressor.compress(data)
+        compressed = compressor.compress(data_t)
         compressed += compressor.flush()
+
+    compressed_t = (input_type(compressed)
+                    if input_type is not bytes else compressed)
 
     with Decompressor(algorithm) as decompressor:
         assert not decompressor.eof
         assert decompressor.needs_input
-        decompressed = decompressor.decompress(compressed)
+        decompressed = decompressor.decompress(compressed_t)
         decompressed += decompressor.flush()
+        assert decompressor.flush() == b''
         assert decompressed == data
         assert decompressor.eof
         assert not decompressor.needs_input
@@ -295,41 +414,59 @@ def _test_stream_roundtrip(algorithm: Algorithm, data: bytes) -> None:
                          (algorithm if algorithm not in _no_stream_algorithms
                           else pytest.param(algorithm, marks=pytest.mark.skip)
                           for algorithm in Algorithm))
-def test_stream_roundtrip_empty(algorithm: Algorithm) -> None:
-    _test_stream_roundtrip(algorithm, b'')
+@pytest.mark.parametrize('input_type', _input_types)
+def test_stream_roundtrip_empty(algorithm: Algorithm,
+                                input_type: _InputTypes) -> None:
+    _test_stream_roundtrip(algorithm, b'', input_type)
 
 
 @pytest.mark.parametrize('algorithm',
                          (algorithm if algorithm not in _no_stream_algorithms
                           else pytest.param(algorithm, marks=pytest.mark.skip)
                           for algorithm in Algorithm))
-def test_stream_roundtrip_nul(algorithm: Algorithm) -> None:
-    _test_stream_roundtrip(algorithm, b'\x00')
+@pytest.mark.parametrize('input_type', _input_types)
+def test_stream_roundtrip_nul(algorithm: Algorithm,
+                              input_type: _InputTypes) -> None:
+    _test_stream_roundtrip(algorithm, b'\x00', input_type)
 
 
 @pytest.mark.parametrize('algorithm',
                          (algorithm if algorithm not in _no_stream_algorithms
                           else pytest.param(algorithm, marks=pytest.mark.skip)
                           for algorithm in Algorithm))
-def test_stream_roundtrip_compressible(algorithm: Algorithm) -> None:
+@pytest.mark.parametrize('input_type', _input_types)
+def test_stream_roundtrip_compressible(algorithm: Algorithm,
+                                       input_type: _InputTypes) -> None:
     _test_stream_roundtrip(algorithm,
-                           b''.join(c.to_bytes() for c in range(256)) * 4096)
+                           b''.join(c.to_bytes() for c in range(256)) * 4096,
+                           input_type)
 
 
 @pytest.mark.parametrize('algorithm',
                          (algorithm if algorithm not in _no_stream_algorithms
                           else pytest.param(algorithm, marks=pytest.mark.skip)
                           for algorithm in Algorithm))
-def test_stream_roundtrip_random(algorithm: Algorithm) -> None:
-    _test_stream_roundtrip(algorithm, random.randbytes(1024 * 1024))
+@pytest.mark.parametrize('input_type', _input_types)
+def test_stream_roundtrip_random(algorithm: Algorithm,
+                                 input_type: _InputTypes) -> None:
+    _test_stream_roundtrip(algorithm, random.randbytes(1024 * 1024), input_type)
 
 
+# Chunked operation doesn’t work with memoryview because of the “TypeError:
+# read-only memoryview has nonzero offset” restriction enforced by
+# apple_compression.py, due to a ctypes limitation.
 @pytest.mark.parametrize('algorithm',
                          (algorithm if algorithm not in _no_stream_algorithms
                           else pytest.param(algorithm, marks=pytest.mark.skip)
                           for algorithm in Algorithm))
-def test_stream_roundtrip_chunks(algorithm: Algorithm) -> None:
+@pytest.mark.parametrize('input_type',
+                         (input_type if input_type is not memoryview else
+                          pytest.param(input_type, marks=pytest.mark.xfail)
+                          for input_type in _input_types))
+def test_stream_roundtrip_chunks(algorithm: Algorithm,
+                                 input_type: _InputTypes) -> None:
     data = b''.join(c.to_bytes() for c in range(256)) * 1024
+    data_t = input_type(data) if input_type is not bytes else data
 
     with Compressor(algorithm) as compressor:
         compressed = b''
@@ -337,9 +474,13 @@ def test_stream_roundtrip_chunks(algorithm: Algorithm) -> None:
         chunk_size = 0
         while offset < len(data):
             chunk_size = (chunk_size % 16) + 1
-            compressed += compressor.compress(data[offset:offset + chunk_size])
+            compressed += compressor.compress(data_t[offset:offset +
+                                                     chunk_size])
             offset += chunk_size
         compressed += compressor.flush()
+
+    compressed_t = (input_type(compressed)
+                    if input_type is not bytes else compressed)
 
     with Decompressor(algorithm) as decompressor:
         assert not decompressor.eof
@@ -347,14 +488,113 @@ def test_stream_roundtrip_chunks(algorithm: Algorithm) -> None:
         decompressed = b''
         offset = 0
         chunk_size = 0
-        while offset < len(compressed):
+        while offset < len(compressed_t):
             assert not decompressor.eof
             assert decompressor.needs_input
             chunk_size = (chunk_size % 16) + 1
-            decompressed += decompressor.decompress(compressed[offset:offset +
-                                                               chunk_size])
+            decompressed += decompressor.decompress(compressed_t[offset:offset +
+                                                                 chunk_size])
             offset += chunk_size
         decompressed += decompressor.flush()
+        assert decompressor.flush() == b''
+        assert decompressed == data
+        assert decompressor.eof
+        assert not decompressor.needs_input
+
+
+# Chunked operation doesn’t work with memoryview because of the “TypeError:
+# read-only memoryview has nonzero offset” restriction enforced by
+# apple_compression.py, due to a ctypes limitation.
+@pytest.mark.parametrize('algorithm',
+                         (algorithm if algorithm not in _no_stream_algorithms
+                          else pytest.param(algorithm, marks=pytest.mark.skip)
+                          for algorithm in Algorithm))
+@pytest.mark.parametrize('input_type',
+                         (input_type if input_type is not memoryview else
+                          pytest.param(input_type, marks=pytest.mark.xfail)
+                          for input_type in _input_types))
+def test_stream_roundtrip_decompress_limited(algorithm: Algorithm,
+                                             input_type: _InputTypes) -> None:
+    data = b''.join(c.to_bytes() for c in range(256)) * 1024
+    data_t = input_type(data) if input_type is not bytes else data
+
+    with Compressor(algorithm) as compressor:
+        compressed = compressor.compress(data_t)
+        compressed += compressor.flush()
+
+    compressed_t = (input_type(compressed)
+                    if input_type is not bytes else compressed)
+
+    with Decompressor(algorithm) as decompressor:
+        assert not decompressor.eof
+        assert decompressor.needs_input
+        decompressed = b''
+        offset = 0
+        compressed_chunk_size = 0
+        while offset < len(compressed_t) or not decompressor.eof:
+            assert not decompressor.eof
+            compressed_chunk_size = (compressed_chunk_size % 16) + 1
+            compressed_chunk = compressed_t[offset:offset +
+                                            compressed_chunk_size]
+            decompressed_chunk_size = ((compressed_chunk_size + 7) % 16)
+            decompressed_chunk = decompressor.decompress(
+                compressed_chunk, max_length=decompressed_chunk_size)
+            assert len(decompressed_chunk) <= decompressed_chunk_size
+            decompressed += decompressed_chunk
+            offset += compressed_chunk_size
+        # decompressor.flush() is intentionally skipped to test that all data is
+        # extracted even `flush` is not called.
+        assert decompressed == data
+        assert decompressor.eof
+        assert not decompressor.needs_input
+
+
+# Chunked operation doesn’t work with memoryview because of the “TypeError:
+# read-only memoryview has nonzero offset” restriction enforced by
+# apple_compression.py, due to a ctypes limitation.
+@pytest.mark.parametrize('algorithm',
+                         (algorithm if algorithm not in _no_stream_algorithms
+                          else pytest.param(algorithm, marks=pytest.mark.skip)
+                          for algorithm in Algorithm))
+@pytest.mark.parametrize('input_type',
+                         (input_type if input_type is not memoryview else
+                          pytest.param(input_type, marks=pytest.mark.xfail)
+                          for input_type in _input_types))
+def test_stream_roundtrip_decompress_limited_flush(
+        algorithm: Algorithm, input_type: _InputTypes) -> None:
+    data = b''.join(c.to_bytes() for c in range(256)) * 1024
+    data_t = input_type(data) if input_type is not bytes else data
+
+    with Compressor(algorithm) as compressor:
+        compressed = compressor.compress(data_t)
+        compressed += compressor.flush()
+
+    compressed_t = (input_type(compressed)
+                    if input_type is not bytes else compressed)
+
+    with Decompressor(algorithm) as decompressor:
+        assert not decompressor.eof
+        assert decompressor.needs_input
+        decompressed = b''
+        offset = 0
+        compressed_chunk_size = 0
+        while offset < len(compressed_t):
+            assert not decompressor.eof
+            compressed_chunk_size = (compressed_chunk_size % 16) + 1
+            compressed_chunk = compressed_t[offset:offset +
+                                            compressed_chunk_size]
+            decompressed_chunk_size = ((compressed_chunk_size + 7) % 16)
+            decompressed_chunk = decompressor.decompress(
+                compressed_chunk, max_length=decompressed_chunk_size)
+            assert len(decompressed_chunk) <= decompressed_chunk_size
+            decompressed += decompressed_chunk
+            offset += compressed_chunk_size
+        assert not decompressor.eof
+        assert not decompressor.needs_input
+        decompressed_chunk = decompressor.flush()
+        assert len(decompressed_chunk)
+        decompressed += decompressed_chunk
+        assert decompressor.flush() == b''
         assert decompressed == data
         assert decompressor.eof
         assert not decompressor.needs_input
@@ -370,6 +610,7 @@ def test_stream_decompress_interoperable(algorithm: Algorithm) -> None:
         assert decompressor.needs_input
         decompressed = decompressor.decompress(compressed)
         decompressed += decompressor.flush()
+        assert decompressor.flush() == b''
         assert decompressed == data
         assert decompressor.eof
         assert not decompressor.needs_input
